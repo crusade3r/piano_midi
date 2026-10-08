@@ -34,6 +34,9 @@ button:disabled{opacity:.45;cursor:not-allowed}
 .drop{display:block;border:2px dashed #2f3747;border-radius:12px;padding:22px 12px;text-align:center;cursor:pointer;color:var(--mute)}
 .drop:hover,.drop.over{border-color:var(--acc);color:var(--text)}
 .drop b{display:block;color:var(--text);font-size:15px;margin-bottom:4px}
+.drop.small{padding:12px;margin-top:8px}.drop.small b{font-size:14px}
+.tiny{font-size:12px;margin:8px 0 0}
+.adv summary{cursor:pointer;color:#c9ced8;margin-top:12px;font-weight:600}
 .bar{height:6px;background:#0e1118;border-radius:4px;overflow:hidden;margin-top:10px}
 .bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--acc),var(--acc2));transition:width .2s}
 .status{margin-top:8px;color:var(--mute);min-height:20px}
@@ -65,6 +68,13 @@ kbd{background:#0e1118;border:1px solid var(--line);border-radius:4px;padding:0 
 <aside>
   <div class="card"><h2>1 · Song</h2>
     <label class="drop" id="drop"><b>Choose or drop an audio file</b>mp3, wav, m4a, ogg…<input type="file" id="file" accept="audio/*" hidden></label>
+    <label class="drop small" id="drop2"><b>…or sheet music / MIDI</b>MusicXML (.musicxml, .mxl, .xml) or .mid<input type="file" id="score" accept=".musicxml,.mxl,.xml,.mid,.midi" hidden></label>
+    <p class="hint tiny">Sheet music as a PDF or photo? Convert it to MusicXML first with a free tool like Audiveris or MuseScore's “Import PDF”, then upload it here.</p>
+    <details class="adv" id="adv"><summary>Advanced: split the song into parts</summary>
+      <div id="advFields"></div>
+      <p class="hint tiny">Uses an AI model (≈140–290 MB download the first time, then saved). Fastest in Chrome or Edge with a graphics card — can take several minutes on slower computers.</p>
+      <button id="reparts" hidden style="margin-top:8px">↻ Redo notes with chosen parts</button>
+    </details>
     <div class="bar"><i id="prog"></i></div>
     <div class="status" id="status">Notes are detected inside your browser — nothing is uploaded anywhere.</div>
   </div>
@@ -86,7 +96,7 @@ kbd{background:#0e1118;border:1px solid var(--line);border-radius:4px;padding:0 
       </div>
       <div id="detect"></div>
       <div class="row"><button id="redetect" disabled>↻ Re-detect notes</button><button id="tDown">Transpose −1</button><button id="tUp">+1</button><button id="undo">↶ Undo</button><button id="clear">Clear all</button></div>
-      <div class="row" style="margin-top:8px"><label class="btn">⬆ Import MIDI<input type="file" id="midiIn" accept=".mid,.midi" hidden></label><button id="midiOut">⬇ Export MIDI</button><span id="count" class="hint" style="margin:0"></span></div>
+      <div class="row" style="margin-top:8px"><label class="btn">⬆ Import MIDI<input type="file" id="midiIn" accept=".mid,.midi" hidden></label><button id="midiOut">⬇ Export MIDI</button><button id="synthBtn" title="Replace the soundtrack with a piano playing these notes">🎹 Piano sound from notes</button><span id="count" class="hint" style="margin:0"></span></div>
     </div>
     <div class="card"><h2>3 · Make video</h2>
       <p class="hint">The video records in real time while the song plays (same length as the song). Keep this tab open and visible until it finishes.</p>
@@ -99,12 +109,83 @@ kbd{background:#0e1118;border:1px solid var(--line);border-radius:4px;padding:0 
 </main>
 <audio id="audio" preload="auto"></audio>
 
+<!-- Background worker: splits a song into stems with the HT-Demucs 6-stem model (drums, bass, other, vocals, guitar, piano) -->
+<script type="text/plain" id="sepSrc">
+import * as ort from 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.webgpu.min.mjs';
+ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/';
+ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(8, navigator.hardwareConcurrency || 4) : 1;
+const GPU_URL = 'https://huggingface.co/kramp/htdemucs-6s-webgpu-onnx/resolve/main/htdemucs_6s.onnx';
+const CPU_URL = 'https://huggingface.co/StemSplitio/htdemucs-6s-onnx/resolve/main/htdemucs_6s_fp16weights.onnx';
+const SEG = 343980, post = m => postMessage(m);
+async function getModel(url) {
+  let cache;
+  try { cache = await caches.open('pw-models'); const hit = await cache.match(url); if (hit) { post({ msg: 'Loading saved AI model…' }); return new Uint8Array(await hit.arrayBuffer()); } } catch {}
+  const r = await fetch(url); if (!r.ok) throw new Error('AI model download failed (' + r.status + ')');
+  const total = +r.headers.get('content-length') || 0, reader = r.body.getReader(), parts = [];
+  let got = 0, lastMB = -1, buf = total ? new Uint8Array(total) : null;
+  for (;;) {
+    const { done, value } = await reader.read(); if (done) break;
+    if (buf && got + value.length <= total) buf.set(value, got); else parts.push(value);
+    got += value.length;
+    if ((got >> 20) !== lastMB) { lastMB = got >> 20; post({ msg: `Downloading AI model (first time only)… ${lastMB}${total ? ' / ' + (total >> 20) : ''} MB`, p: total ? got / total : 0 }); }
+  }
+  if (!buf || parts.length) { const all = new Uint8Array(got); let o = 0; if (buf) { all.set(buf.subarray(0, Math.min(total, got))); o = Math.min(total, got); } for (const p of parts) { all.set(p, o); o += p.length; } buf = all; }
+  try { await cache?.put(url, new Response(buf)); } catch {}
+  return buf;
+}
+async function cpuSession() {
+  const m = await getModel(CPU_URL); post({ msg: 'Preparing AI model (CPU — slower)…' });
+  const s = await ort.InferenceSession.create(m, { executionProviders: ['wasm'] }); s.gpu = false; return s;
+}
+async function makeSession() {
+  try {
+    if (navigator.gpu && await navigator.gpu.requestAdapter()) {
+      const m = await getModel(GPU_URL); post({ msg: 'Preparing AI model (graphics card)…' });
+      const s = await ort.InferenceSession.create(m, { executionProviders: ['webgpu'] }); s.gpu = true; return s;
+    }
+  } catch (e) { console.warn(e); }
+  return cpuSession();
+}
+let ses;
+onmessage = async ({ data: { L, R } }) => {
+  try {
+    ses ||= await makeSession();
+    const N = L.length, hop = Math.floor(SEG * .8), w = new Float32Array(SEG), inp = new Float32Array(2 * SEG), ws = new Float32Array(N);
+    for (let i = 0; i < SEG; i++) w[i] = Math.min(i + 1, SEG - i);
+    const G = { vocals: [3], piano: [5], other: [1, 2, 4] }, acc = {};   // stems: drums, bass, other, vocals, guitar, piano
+    for (const k in G) acc[k] = [new Float32Array(N), new Float32Array(N)];
+    const starts = []; for (let s = 0; ; s += hop) { starts.push(s); if (s + SEG >= N) break; }
+    const t0 = performance.now();
+    post({ msg: 'Splitting the song…', p: 0 });
+    for (let ci = 0; ci < starts.length; ci++) {
+      const s = starts[ci], n = Math.min(SEG, N - s);
+      inp.fill(0); inp.set(L.subarray(s, s + n), 0); inp.set(R.subarray(s, s + n), SEG);
+      const feeds = { mix: new ort.Tensor('float32', inp, [1, 2, SEG]) };
+      let out;
+      try { out = await ses.run(feeds); }
+      catch (e) { if (!ses.gpu) throw e; console.warn(e); post({ msg: 'Graphics card failed — switching to CPU (slower)…' }); ses = await cpuSession(); out = await ses.run(feeds); }
+      const d = out.stems.data;
+      for (let i = 0; i < n; i++) ws[s + i] += w[i];
+      for (const k in G) for (let c = 0; c < 2; c++) { const a = acc[k][c]; for (const st of G[k]) { const b = (st * 2 + c) * SEG; for (let i = 0; i < n; i++) a[s + i] += d[b + i] * w[i]; } }
+      const p = (ci + 1) / starts.length, left = (performance.now() - t0) / (ci + 1) * (starts.length - ci - 1) / 60000;
+      post({ p, msg: `Splitting the song… ${Math.round(p * 100)}%` + (ci < starts.length - 1 ? ` (about ${left < 1 ? '<1' : Math.ceil(left)} min left)` : '') });
+    }
+    const res = {}, tr = [];
+    for (const k in acc) res[k] = acc[k].map(a => { const o = new Int16Array(N); for (let i = 0; i < N; i++) o[i] = Math.max(-1, Math.min(1, a[i] / (ws[i] || 1))) * 32767; tr.push(o.buffer); return o; });
+    postMessage({ out: res }, tr);
+  } catch (e) { post({ error: (e && e.message) || String(e) }); }
+};
+</script>
+
 <script type="module">
 const $ = id => document.getElementById(id);
 const cv = $('cv'), ctx = cv.getContext('2d'), audio = $('audio');
 const BP_URLS = ['https://cdn.jsdelivr.net/npm/@spotify/basic-pitch@1.0.1/+esm', 'https://esm.sh/@spotify/basic-pitch@1.0.1'];
 const MODEL = 'https://cdn.jsdelivr.net/npm/@spotify/basic-pitch@1.0.1/model/model.json';
 const MIDI_URL = 'https://cdn.jsdelivr.net/npm/@tonejs/midi@2.0.28/+esm';
+const FFLATE = 'https://cdn.jsdelivr.net/npm/fflate@0.8.2/+esm';
+const PIANO_URL = 'https://tonejs.github.io/audio/salamander/';
+const LABEL = { vocals: 'Vocals', piano: 'Piano', inst: 'Instrumental' };
 const NAMES = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
 const pc = m => ((m % 12) + 12) % 12;
 const nn = m => NAMES[pc(m)] + (Math.floor(m / 12) - 1);
@@ -116,10 +197,11 @@ const DEF = { colorMode:'split', left:'#22d3ee', right:'#f472b6', split:60, bg:'
   barW:88, radius:6, opacity:100, gradient:true, outline:false, darkBlack:true, labels:false,
   glow:20, particles:true, pAmount:4, hitGlow:true, keyGlow:true, guides:true,
   fall:3, kbH:14, range:'auto', res:'1920x1080', fps:'30', leadIn:2, sound:true,
-  onset:0.5, frameT:0.3, minLen:60, offset:0 };
+  onset:0.3, frameT:0.22, minLen:40, offset:0, c3:'#a3e635',
+  adv:false, partV:false, partP:true, partI:false, track:'orig' };
 let S = { ...DEF };
-try { Object.assign(S, JSON.parse(localStorage.getItem('pw-settings') || '{}')); } catch {}
-const save = () => { try { localStorage.setItem('pw-settings', JSON.stringify(S)); } catch {} };
+try { Object.assign(S, JSON.parse(localStorage.getItem('pw-settings-v2') || '{}')); } catch {}
+const save = () => { try { localStorage.setItem('pw-settings-v2', JSON.stringify(S)); } catch {} };
 
 const PRESETS = {
   Neon:{colorMode:'split',left:'#22d3ee',right:'#f472b6',bg:'#05060a',bg2:'#161b3a',glow:22,gradient:true,outline:false,particles:true,radius:6,hitGlow:true},
@@ -131,8 +213,9 @@ const PRESETS = {
 
 const UI = [
   ['Colours', [
-    ['colorMode','select','Colour style',{split:'Two colours (low / high notes)',single:'One colour',rainbow:'Rainbow by pitch',chroma:'Colour per note name'}],
-    ['left','color','Low notes colour'], ['right','color','High notes / main colour'],
+    ['colorMode','select','Colour style',{split:'Two colours (low / high notes)',single:'One colour',rainbow:'Rainbow by pitch',chroma:'Colour per note name',part:'By part (advanced mode) / hand (sheet music)'}],
+    ['left','color','Low notes / left hand / piano'], ['right','color','High notes / right hand / vocals'],
+    ['c3','color','Instrumental part colour'],
     ['split','range','Split point',[36,84,1]],
     ['bg','color','Background top'], ['bg2','color','Background bottom']]],
   ['Bars', [
@@ -151,9 +234,9 @@ const UI = [
     ['sound','check','Hear the song while rendering']]],
 ];
 const DET = [
-  ['onset','range','Note start threshold (higher = fewer notes)',[0.1,0.9,0.05]],
-  ['frameT','range','Note hold threshold (higher = shorter notes)',[0.1,0.9,0.05]],
-  ['minLen','range','Ignore notes shorter than',[20,300,10,'ms']],
+  ['onset','range','Note start threshold (lower = more notes)',[0.05,0.9,0.05]],
+  ['frameT','range','Note hold threshold (lower = longer notes)',[0.05,0.9,0.01]],
+  ['minLen','range','Ignore notes shorter than',[10,300,10,'ms']],
   ['offset','range','Shift all notes vs audio (sync)',[-1,1,0.01,'s']],
 ];
 
@@ -178,15 +261,24 @@ UI.forEach(([title, items], i) => {
   d.innerHTML = `<summary>${title}</summary>`; items.forEach(a => d.append(field(...a))); $('controls').append(d);
 });
 DET.forEach(a => $('detect').append(field(...a)));
+[['adv','check','Split the song before finding notes'], ['partV','check','🎤 Vocals'], ['partP','check','🎹 Piano'],
+ ['partI','check','🎸 Instrumental (all instruments, no drums)'], ['track','select','Video soundtrack',{orig:'Original song',parts:'Only the chosen parts'}]
+].forEach(a => $('advFields').append(field(...a)));
+$('adv').open = S.adv;
 for (const [name, p] of Object.entries({ ...PRESETS, Reset: DEF })) {
   const b = document.createElement('button'); b.textContent = name;
   b.onclick = () => { Object.assign(S, name === 'Reset' ? { ...DEF, onset:S.onset, frameT:S.frameT, minLen:S.minLen, offset:S.offset } : p); Object.values(inputs).forEach(f => f()); save(); changed('res'); };
   $('presets').append(b);
 }
-function changed(k) { if (k === 'res') resize(); else relayout(); }
+let detT;
+function changed(k) {
+  if (k === 'res') resize(); else relayout();
+  if (['onset','frameT','minLen'].includes(k) && raw.length) { clearTimeout(detT); detT = setTimeout(() => buildNotes(true), 400); }
+}
 
 /* ---------- state ---------- */
-let notes = [], sel = -1, undoStack = [], raw = null, BP = null, bpModel = null, dur = 0, fname = 'song';
+let notes = [], sel = -1, undoStack = [], raw = [], BP = null, bpModel = null, dur = 0, fname = 'song';
+let groups = null, origFile = null, working = false, detGen = 0;
 let L = {}, rects = [], parts = [], rec = null, actx, spk, dest;
 const status = t => $('status').textContent = t;
 const setProg = p => $('prog').style.width = Math.round(p * 100) + '%';
@@ -223,7 +315,8 @@ function colorOf(n) {
     case 'single': return S.right;
     case 'rainbow': return hsl(((n.p - L.lo) / Math.max(1, L.hi - L.lo)) * 300, .85, .6);
     case 'chroma': return hsl(pc(n.p) * 30, .8, .6);
-    default: return n.p < S.split ? S.left : S.right;
+    case 'part': if (n.src) return { vocals: S.right, piano: S.left, inst: S.c3 }[n.src] || S.right; // fall through
+    default: if (n.h) return n.h === 'L' ? S.left : S.right; return n.p < S.split ? S.left : S.right;
   }
 }
 
@@ -318,32 +411,206 @@ async function loadBP() {
   for (const u of BP_URLS) { try { const m = await import(u); const mod = m.BasicPitch ? m : m.default; if (mod?.BasicPitch) return mod; } catch (e) { console.warn(u, e); } }
   throw new Error('Could not load the note detector — check your internet connection.');
 }
-async function loadAudio(f) {
-  if (!f || rec) return;
+const tick = () => new Promise(r => setTimeout(r, 0));
+const offCtx = (ch, len, sr) => new OfflineAudioContext(ch, Math.max(1, Math.ceil(len)), sr);
+function setAudio(src, name) {
   audio.pause(); if (audio.src) URL.revokeObjectURL(audio.src);
-  audio.src = URL.createObjectURL(f); fname = f.name.replace(/\.[^.]+$/, '') || 'song';
-  notes = []; undoStack = []; raw = null; sel = -1; refresh(); setProg(0); status('Reading audio…');
-  try {
-    const buf = await new OfflineAudioContext(1, 1, 44100).decodeAudioData(await f.arrayBuffer());
-    dur = buf.duration; $('scrub').max = dur;
-    const off = new OfflineAudioContext(1, Math.ceil(dur * 22050), 22050), src = off.createBufferSource();
-    src.buffer = buf; src.connect(off.destination); src.start();
-    const mono = (await off.startRendering()).getChannelData(0);
-    status('Loading note detector (first time takes a moment)…');
-    BP ||= await loadBP(); bpModel ||= new BP.BasicPitch(MODEL);
-    const fr = [], on = [], co = [];
-    await bpModel.evaluateModel(mono, (a, b, c) => { fr.push(...a); on.push(...b); co.push(...c); },
-      p => { setProg(p); status(`Detecting notes… ${Math.round(p * 100)}%`); });
-    raw = { fr, on, co }; buildNotes(false); setProg(1);
-    status(`Done — ${notes.length} notes found. Press Play to preview.`);
-  } catch (e) { console.error(e); status('⚠ ' + (e.message || e)); }
-  refresh();
+  audio.src = URL.createObjectURL(src); if (name) fname = name;
 }
-function buildNotes(undoable = true) {
-  if (!raw) return; if (undoable) snap();
-  const ev = BP.noteFramesToTime(BP.outputToNotesPoly(raw.fr, raw.on, S.onset, S.frameT, Math.max(1, Math.round(S.minLen / 1000 * 86.13))));
-  notes = ev.map(n => ({ p: n.pitchMidi, s: n.startTimeSeconds, d: n.durationSeconds, a: n.amplitude }));
-  sel = -1; refresh();
+function peakNorm(chs, target = .9) {   // returns original peak
+  let m = 0; for (const a of chs) for (let i = 0; i < a.length; i++) { const x = Math.abs(a[i]); if (x > m) m = x; }
+  if (m > 0) { const g = target / m; for (const a of chs) for (let i = 0; i < a.length; i++) a[i] *= g; }
+  return m;
+}
+async function to22k(chs, sr) {
+  const b = new AudioBuffer({ length: chs[0].length, numberOfChannels: chs.length, sampleRate: sr });
+  chs.forEach((c, i) => b.copyToChannel(c, i));
+  const off = offCtx(1, b.duration * 22050, 22050), s = off.createBufferSource();
+  s.buffer = b; s.connect(off.destination); s.start();
+  const mono = (await off.startRendering()).getChannelData(0);
+  return [mono, peakNorm([mono])];
+}
+function wav(chs, sr) {
+  const n = chs[0].length, c = chs.length, v = new DataView(new ArrayBuffer(44 + n * c * 2));
+  const w = (o, s) => [...s].forEach((ch, i) => v.setUint8(o + i, ch.charCodeAt(0)));
+  w(0, 'RIFF'); v.setUint32(4, 36 + n * c * 2, true); w(8, 'WAVE'); w(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, c, true); v.setUint32(24, sr, true); v.setUint32(28, sr * c * 2, true); v.setUint16(32, c * 2, true); v.setUint16(34, 16, true);
+  w(36, 'data'); v.setUint32(40, n * c * 2, true);
+  for (let i = 0, o = 44; i < n; i++) for (let k = 0; k < c; k++, o += 2) v.setInt16(o, Math.max(-1, Math.min(1, chs[k][i])) * 32767, true);
+  return new Blob([v], { type: 'audio/wav' });
+}
+async function transcribe(mono, src, label) {
+  status('Loading note detector (first time takes a moment)…');
+  BP ||= await loadBP(); bpModel ||= new BP.BasicPitch(MODEL);
+  const fr = [], on = [];
+  await bpModel.evaluateModel(mono, (a, b) => { for (const x of a) fr.push(x); for (const x of b) on.push(x); },
+    p => { setProg(p); status(`Listening to ${label}… ${Math.round(p * 100)}%`); });
+  raw.push({ src, fr, on });
+}
+async function loadAudio(f) {
+  if (!f || rec || working) return; working = true; origFile = f;
+  setAudio(f, f.name.replace(/\.[^.]+$/, '') || 'song');
+  notes = []; undoStack = []; raw = []; groups = null; sel = -1; refresh(); setProg(0); status('Reading audio…');
+  try {
+    const buf = await offCtx(2, 1, 44100).decodeAudioData(await f.arrayBuffer());
+    dur = buf.duration; $('scrub').max = dur;
+    const chs = [buf.getChannelData(0), buf.getChannelData(buf.numberOfChannels > 1 ? 1 : 0)];
+    if (S.adv && (S.partV || S.partP || S.partI)) { groups = await separate(chs); await useParts(); }
+    else { const [mono] = await to22k(chs, 44100); await transcribe(mono, 'mix', 'the song'); await buildNotes(false); }
+  } catch (e) { console.error(e); status('⚠ ' + (e.message || e)); }
+  working = false; refresh();
+}
+// sum separated groups (stored as Int16 stereo) into float stereo
+function sumG(names) {
+  const N = groups.vocals[0].length, out = [new Float32Array(N), new Float32Array(N)];
+  for (const nm of names) for (let c = 0; c < 2; c++) { const g = groups[nm][c], o = out[c]; for (let i = 0; i < N; i++) o[i] += g[i] / 32767; }
+  return out;
+}
+async function useParts() {
+  const chosen = [S.partV && 'vocals', S.partP && 'piano', S.partI && 'inst'].filter(Boolean);
+  if (!groups || !chosen.length) { status('Tick at least one part.'); return; }
+  const parts = { vocals: ['vocals'], piano: ['piano'], inst: S.partP ? ['other'] : ['other', 'piano'] };
+  raw = []; const skipped = [];
+  for (const name of chosen) {
+    const [mono, peak] = await to22k(sumG(parts[name]), 44100);
+    if (peak < .01) { skipped.push(LABEL[name]); continue; }
+    await transcribe(mono, name, LABEL[name].toLowerCase());
+  }
+  if (S.track === 'parts') { const u = [...new Set(chosen.flatMap(n => parts[n]))], chs = sumG(u); peakNorm(chs); setAudio(wav(chs, 44100)); }
+  else if (origFile) setAudio(origFile);
+  await buildNotes(false);
+  if (skipped.length) status(`Done — ${notes.length} notes. No ${skipped.join(' / ').toLowerCase()} found in this song.`);
+}
+// Post-processing in small time chunks: fast, never freezes, and notes appear as they're found
+async function buildNotes(undoable = true) {
+  if (!raw.length || !BP) return; if (undoable) snap();
+  const gen = ++detGen, minF = Math.max(1, Math.round(S.minLen / 1000 * 86.13)), CH = 860, LP = 86, RP = 344;
+  const total = raw.reduce((a, r) => a + Math.ceil(r.fr.length / CH), 0); let done = 0;
+  const acc = notes = []; sel = -1; showSel();
+  for (const r of raw) for (let a = 0; a < r.fr.length; a += CH) {
+    const s = Math.max(0, a - LP), e = Math.min(r.fr.length, a + CH + RP);
+    const ev = BP.outputToNotesPoly(r.fr.slice(s, e).map(x => x.slice()), r.on.slice(s, e).map(x => x.slice()), S.onset, S.frameT, minF);
+    const keep = []; for (const n of ev) { const st = n.startFrame + s; if (st >= a && st < a + CH) keep.push({ ...n, startFrame: st }); }
+    for (const n of BP.noteFramesToTime(keep))
+      acc.push({ p: n.pitchMidi, s: n.startTimeSeconds, d: n.durationSeconds, a: n.amplitude, ...(r.src !== 'mix' && { src: r.src }) });
+    done++; setProg(done / total); status(`Finding notes… ${Math.round(done / total * 100)}% (${notes.length} so far)`);
+    relayout(); await tick(); if (gen !== detGen) return;
+  }
+  status(`Done — ${notes.length} notes found. Press Play to preview.`); refresh();
+}
+
+/* ---------- stem splitting (Demucs 6-stem AI model in a background worker) ---------- */
+let sepWorker;
+function separate(chs) {
+  return new Promise((res, rej) => {
+    sepWorker ||= new Worker(URL.createObjectURL(new Blob([$('sepSrc').textContent], { type: 'text/javascript' })), { type: 'module' });
+    sepWorker.onmessage = ({ data: d }) => { if (d.msg) status(d.msg); if (d.p != null) setProg(d.p); if (d.error) rej(new Error(d.error)); if (d.out) res(d.out); };
+    sepWorker.onerror = e => { rej(new Error('The splitter could not start: ' + (e.message || 'check your connection'))); sepWorker = null; };
+    const L = chs[0].slice(), R = chs[1].slice();
+    status('Starting the splitter…'); sepWorker.postMessage({ L, R }, [L.buffer, R.buffer]);
+  });
+}
+
+/* ---------- sheet music & piano sound ---------- */
+function parseScore(xml) {
+  const doc = new DOMParser().parseFromString(xml, 'application/xml');
+  if (doc.getElementsByTagName('parsererror').length || doc.documentElement.nodeName !== 'score-partwise')
+    throw new Error('That file isn’t a MusicXML score — export it as MusicXML from your notation app.');
+  const STEP = { C: 0, D: 2, E: 4, F: 5, G: 7, A: 9, B: 11 };
+  const kid = (el, n) => { for (const c of el.children) if (c.nodeName === n) return c; }, txt = (el, n) => kid(el, n)?.textContent;
+  const list = [], tempos = [], parts = [...doc.getElementsByTagName('part')];
+  parts.forEach((part, pi) => {
+    let div = 1, pos = 0, last = 0; const open = {};
+    for (const meas of part.children) {
+      if (meas.nodeName !== 'measure') continue;
+      let max = pos;
+      for (const el of meas.children) {
+        const nm = el.nodeName;
+        if (nm === 'attributes') { const d = el.getElementsByTagName('divisions')[0]; if (d) div = +d.textContent || 1; }
+        else if (nm === 'backup') pos -= (+txt(el, 'duration') || 0) / div;
+        else if (nm === 'forward') pos += (+txt(el, 'duration') || 0) / div;
+        else if (nm === 'direction' || nm === 'sound') { const s = nm === 'sound' ? el : el.getElementsByTagName('sound')[0], bpm = s && +s.getAttribute('tempo'); if (bpm > 0 && pi === 0) tempos.push([pos, bpm]); }
+        else if (nm === 'note') {
+          if (kid(el, 'grace') || kid(el, 'cue')) continue;
+          const dq = (+txt(el, 'duration') || 0) / div, start = kid(el, 'chord') ? last : pos;
+          if (!kid(el, 'chord')) { last = pos; pos += dq; }
+          const p = kid(el, 'pitch');
+          if (p) {
+            const midi = (+txt(p, 'octave') + 1) * 12 + STEP[txt(p, 'step')] + (+txt(p, 'alter') || 0);
+            const ties = [...el.children].filter(c => c.nodeName === 'tie').map(t => t.getAttribute('type'));
+            const staff = +txt(el, 'staff') || 1, key = midi + '_' + staff + '_' + (txt(el, 'voice') || 1);
+            if (ties.includes('stop') && open[key]) { const o = open[key]; o.dq = start + dq - o.q; if (!ties.includes('start')) delete open[key]; }
+            else { const n = { q: start, dq, p: midi, staff, pi }; list.push(n); if (ties.includes('start')) open[key] = n; }
+          }
+        }
+        max = Math.max(max, pos);
+      }
+      pos = max;
+    }
+  });
+  tempos.sort((a, b) => a[0] - b[0]);
+  if (!tempos.length || tempos[0][0] > 0) tempos.unshift([0, tempos[0]?.[1] || 120]);
+  const sec = q => { let t = 0; for (let i = 0; i < tempos.length && q > tempos[i][0]; i++) t += (Math.min(q, tempos[i + 1]?.[0] ?? Infinity) - tempos[i][0]) * 60 / tempos[i][1]; return t; };
+  const twoStaves = list.some(n => n.staff === 2), twoParts = parts.length === 2;
+  return list.map(n => ({ p: n.p, s: sec(n.q), d: Math.max(.05, sec(n.q + n.dq) - sec(n.q)), a: .8,
+    ...(twoStaves ? { h: n.staff === 2 ? 'L' : 'R' } : twoParts ? { h: n.pi ? 'L' : 'R' } : {}) }));
+}
+async function readMidi(f) {
+  const Midi = await midiLib(), m = new Midi(await f.arrayBuffer()), tr = m.tracks.filter(t => t.notes.length && !t.instrument?.percussion);
+  return tr.flatMap((t, i) => t.notes.map(n => ({ p: n.midi, s: n.time, d: n.duration, a: n.velocity, ...(tr.length === 2 && { h: i ? 'L' : 'R' }) })));
+}
+async function loadScore(f) {
+  if (!f || rec || working) return; working = true; setProg(0); status('Reading sheet music…');
+  try {
+    let list;
+    if (/\.midi?$/i.test(f.name)) list = await readMidi(f);
+    else {
+      let xml;
+      if (/\.mxl$/i.test(f.name)) {
+        const { unzipSync, strFromU8 } = await import(FFLATE), z = unzipSync(new Uint8Array(await f.arrayBuffer()));
+        const c = z['META-INF/container.xml'], path = (c && strFromU8(c).match(/full-path="([^"]+)"/)?.[1]) || Object.keys(z).find(k => /\.(xml|musicxml)$/i.test(k) && !k.startsWith('META-INF'));
+        if (!path || !z[path]) throw new Error('No score found inside that .mxl file.');
+        xml = strFromU8(z[path]);
+      } else xml = await f.text();
+      list = parseScore(xml);
+    }
+    if (!list.length) throw new Error('No notes found in that file.');
+    notes = list; undoStack = []; raw = []; groups = null; origFile = null; sel = -1; refresh();
+    setAudio(await synth(notes), f.name.replace(/\.[^.]+$/, ''));
+    status(`Loaded ${notes.length} notes (repeats play once). Press Play to preview.`);
+  } catch (e) { console.error(e); status('⚠ ' + (e.message || e)); }
+  working = false; refresh();
+}
+const SAMPLES = [];
+for (let o = 0; o <= 8; o++) [['C', 0], ['Ds', 3], ['Fs', 6], ['A', 9]].forEach(([n, k]) => { const m = (o + 1) * 12 + k; if (m >= 21 && m <= 108) SAMPLES.push([m, n + o]); });
+const nearest = p => SAMPLES.reduce((b, s) => Math.abs(s[0] - p) < Math.abs(b[0] - p) ? s : b);
+const sampleBufs = {};
+async function synth(list) {
+  const sr = 44100; let end = 1; for (const n of list) end = Math.max(end, n.s + n.d);
+  const off = offCtx(2, (end + 2.5) * sr, sr); let ok = true;
+  status('Loading piano sounds…');
+  try { await Promise.all([...new Set(list.map(n => nearest(n.p)))].map(async ([, name]) => {
+    sampleBufs[name] ||= await off.decodeAudioData(await (await fetch(PIANO_URL + name + '.mp3')).arrayBuffer()); })); } catch (e) { console.warn(e); ok = false; }
+  const comp = off.createDynamicsCompressor(), master = off.createGain(); master.gain.value = .5; master.connect(comp).connect(off.destination);
+  for (const n of list) {
+    const t = Math.max(0, n.s), v = .3 + .7 * (n.a ?? .8), g = off.createGain(); g.connect(master);
+    if (ok) {
+      const [m, name] = nearest(n.p), src = off.createBufferSource(); src.buffer = sampleBufs[name]; src.playbackRate.value = 2 ** ((n.p - m) / 12);
+      g.gain.setValueAtTime(v, t); g.gain.setTargetAtTime(0, t + n.d, .15); src.connect(g); src.start(t); src.stop(t + n.d + 1.5);
+    } else {
+      const o = off.createOscillator(); o.type = 'triangle'; o.frequency.value = 440 * 2 ** ((n.p - 69) / 12);
+      g.gain.setValueAtTime(v * .3, t); g.gain.setTargetAtTime(0, t, .6); g.gain.setTargetAtTime(0, t + n.d, .08); o.connect(g); o.start(t); o.stop(t + n.d + 1);
+    }
+  }
+  status('Building piano audio…');
+  const b = await off.startRendering(), chs = [b.getChannelData(0), b.getChannelData(1)]; peakNorm(chs);
+  return wav(chs, sr);
+}
+async function pianoFromNotes() {
+  if (!notes.length || working || rec) return; working = true; setProg(0);
+  try { setAudio(await synth(notes)); origFile = null; setProg(1); status('Piano soundtrack ready — press Play.'); }
+  catch (e) { console.error(e); status('⚠ ' + (e.message || e)); }
+  working = false; refresh();
 }
 function ensureCtx() {
   if (actx) return;
@@ -361,8 +628,8 @@ audio.onloadedmetadata = () => { dur = audio.duration || dur; $('scrub').max = d
 
 /* ---------- editing ---------- */
 const snap = () => { undoStack.push(JSON.stringify(notes)); if (undoStack.length > 80) undoStack.shift(); };
-function undo() { if (!undoStack.length) return; notes = JSON.parse(undoStack.pop()); sel = -1; refresh(); }
-function refresh() { relayout(); showSel(); $('rec').disabled = !audio.src || !!rec; $('redetect').disabled = !raw; }
+function undo() { if (!undoStack.length) return; detGen++; notes = JSON.parse(undoStack.pop()); sel = -1; refresh(); }
+function refresh() { relayout(); showSel(); $('rec').disabled = !audio.src || !!rec; $('redetect').disabled = !raw.length; $('reparts').hidden = !groups; }
 function showSel() {
   const n = notes[sel]; $('sel').classList.toggle('on', !!n); if (!n) return;
   $('nP').value = n.p; $('nName').textContent = nn(n.p); $('nS').value = n.s.toFixed(2); $('nD').value = n.d.toFixed(2); $('nC').value = colorOf(n);
@@ -418,15 +685,17 @@ const midiLib = async () => { const m = await import(MIDI_URL); return m.Midi ||
 const download = (blob, name) => { const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 5000); };
 $('midiIn').onchange = async e => {
   const f = e.target.files[0]; e.target.value = ''; if (!f) return;
-  try { const Midi = await midiLib(), m = new Midi(await f.arrayBuffer()); snap();
-    notes = m.tracks.flatMap(t => t.notes.map(n => ({ p: n.midi, s: n.time, d: n.duration, a: n.velocity }))); sel = -1; refresh();
+  try { const list = await readMidi(f); snap(); notes = list; sel = -1; refresh();
     status(`Imported ${notes.length} notes from MIDI.`);
+    if (!audio.src) await pianoFromNotes();
   } catch (err) { status('⚠ Could not read that MIDI file.'); console.error(err); }
 };
 $('midiOut').onclick = async () => {
   if (!notes.length) return;
-  try { const Midi = await midiLib(), m = new Midi(), tr = m.addTrack();
-    notes.forEach(n => tr.addNote({ midi: n.p, time: Math.max(0, n.s + S.offset), duration: Math.max(.02, n.d), velocity: Math.min(1, Math.max(.1, n.a ?? .8)) }));
+  try { const Midi = await midiLib(), m = new Midi(), byTrack = {};
+    notes.forEach(n => { const k = n.src ? LABEL[n.src] : n.h ? (n.h === 'L' ? 'Left hand' : 'Right hand') : 'Notes'; (byTrack[k] ||= []).push(n); });
+    for (const [k, list] of Object.entries(byTrack)) { const tr = m.addTrack(); tr.name = k;
+      list.forEach(n => tr.addNote({ midi: n.p, time: Math.max(0, n.s + S.offset), duration: Math.max(.02, n.d), velocity: Math.min(1, Math.max(.1, n.a ?? .8)) })); }
     download(new Blob([m.toArray()], { type: 'audio/midi' }), fname + '.mid');
   } catch (err) { status('⚠ MIDI export failed.'); console.error(err); }
 };
@@ -468,11 +737,14 @@ $('play').onclick = togglePlay;
 $('scrub').oninput = e => { if (rec) return; audio.currentTime = +e.target.value; parts = []; };
 $('scrub').onpointerdown = () => scrubbing = true;
 addEventListener('pointerup', () => scrubbing = false);
-$('file').onchange = e => loadAudio(e.target.files[0]);
-const drop = $('drop');
-drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); };
-drop.ondragleave = () => drop.classList.remove('over');
-drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); loadAudio(e.dataTransfer.files[0]); };
+$('file').onchange = e => { loadAudio(e.target.files[0]); e.target.value = ''; };
+$('score').onchange = e => { loadScore(e.target.files[0]); e.target.value = ''; };
+$('synthBtn').onclick = pianoFromNotes;
+$('reparts').onclick = async () => { if (!groups || working) return; working = true; try { await useParts(); } catch (e) { status('⚠ ' + (e.message || e)); } working = false; refresh(); };
+[['drop', loadAudio], ['drop2', loadScore]].forEach(([id, fn]) => { const d = $(id);
+  d.ondragover = e => { e.preventDefault(); d.classList.add('over'); };
+  d.ondragleave = () => d.classList.remove('over');
+  d.ondrop = e => { e.preventDefault(); d.classList.remove('over'); fn(e.dataTransfer.files[0]); }; });
 
 resize(); requestAnimationFrame(loop);
 </script>
